@@ -26,7 +26,7 @@ import torch.nn as nn
 import torchvision.models as tvm
 import torchvision.transforms as T
 from PIL import Image
-from rfdetr import RFDETRNano
+from onnx_detector import OnnxDetector   # ONNX Runtime drop-in for RFDETRNano
 from rfdetr.assets.coco_classes import COCO_CLASSES
 from device_memory import DeviceMemory, build_embedder
 
@@ -45,10 +45,10 @@ DETECT_THRESH = {
     'display': 0.40,           # lower: catch TVs earlier
 }
 ROUTE_EVERY_N_FRAMES = 2      # router every 2nd frame is plenty
-DETECT_EVERY_N_FRAMES = 2     # run detector every 2nd frame; reuse boxes between
-PROCESS_WIDTH = 640            # smaller = faster inference, 640 is sweet spot
+DETECT_EVERY_N_FRAMES = 3     # run detector every 2nd frame; reuse boxes between
+PROCESS_WIDTH = 416            # smaller = faster inference, 640 is sweet spot
 MODEL_DEVICE = os.environ.get('MOE_DEVICE', 'cpu')
-VERIFY_EVERY_N_FRAMES = 2     # share COCO pass, so verification is nearly free
+VERIFY_EVERY_N_FRAMES = 0     # share COCO pass, so verification is nearly free
 VERIFY_THRESH = 0.40          # lower: override router sooner
 
 # ---------- Device memory (re-ID / naming) knobs ----------
@@ -117,7 +117,7 @@ device_memory = DeviceMemory(DEVICE_MEMORY_PATH, sim_thresh=REID_SIM_THRESH)
 print(f"  remembered devices on disk: {len(device_memory)}")
 
 print("Loading climate expert...")
-climate_expert = RFDETRNano(pretrain_weights=str(CLIMATE_PTH), num_classes=1, device=MODEL_DEVICE)
+climate_expert = OnnxDetector('weights/climate.onnx', device=MODEL_DEVICE)
 try:
     climate_expert.optimize_for_inference()
     print("  ✓ climate expert optimized for inference")
@@ -125,7 +125,7 @@ except Exception:
     pass  # older rfdetr versions may not support this
 
 print("Loading COCO model (kitchen + display experts)...")
-coco_model = RFDETRNano(device=MODEL_DEVICE)
+coco_model = OnnxDetector('weights/coco.onnx', device=MODEL_DEVICE)
 try:
     coco_model.optimize_for_inference()
     print("  ✓ COCO model optimized for inference")
@@ -383,7 +383,7 @@ def draw_hud(frame_bgr, probs, active_expert, raw_pick, raw_conf, fps, smoothing
 # ---------- Main loop ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source', default='0',
+    parser.add_argument('--source', default='test_assets/device.mp4',
                         help="Video path or '0' for webcam")
     parser.add_argument('--out', default=None,
                         help="Optional path to save annotated output video (e.g. out.mp4)")
@@ -544,10 +544,16 @@ def main():
             active_expert = Counter(smoothing_buf).most_common(1)[0][0]
 
         # --- Device re-ID: fingerprint current boxes, look up saved names ---
+        # Only pay this cost on detect frames AND only once at least one device
+        # has been named. Before naming anything it is a pure no-op, so the demo
+        # runs at full speed until the feature is actually used.
         if should_detect:
-            last_embeddings = []
-            last_names = []
-            if last_detections is not None:
+            if len(device_memory) == 0 or last_detections is None:
+                last_embeddings = []
+                last_names = []
+            else:
+                last_embeddings = []
+                last_names = []
                 for bi in range(len(last_detections)):
                     crop = crop_pil(frame_bgr, last_detections.xyxy[bi])
                     if crop is None:
